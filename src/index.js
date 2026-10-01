@@ -1,223 +1,37 @@
-import { DurableObject } from "cloudflare:workers";
+import {
+  DurableObject,
+  WorkerEntrypoint
+} from "cloudflare:workers";
+
 
 const MAX_USERNAME_LENGTH = 40;
 
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const path = url.pathname.replace(/\/+$/, "") || "/";
-
-    // =====================================================
-    // TEST
-    // =====================================================
-
-    if (path === "/" || path === "/health") {
-      return json({
-        success: true,
-        service: "Weizend Realtime",
-        realtime: "websocket-hibernation-v1"
-      });
-    }
-
-
-    // =====================================================
-    // MARKET -> WEBSOCKET BAĞLANTISI
-    // =====================================================
-
-    if (path === "/ws") {
-      if (request.method !== "GET") {
-        return json({
-          success: false,
-          error: "GET gerekli."
-        }, 405);
-      }
-
-      const upgrade =
-        request.headers.get("Upgrade") || "";
-
-      if (upgrade.toLowerCase() !== "websocket") {
-        return json({
-          success: false,
-          error: "WebSocket bağlantısı gerekli."
-        }, 426);
-      }
-
-      const username =
-        cleanUsername(
-          url.searchParams.get("user")
-        );
-
-      if (!isValidUsername(username)) {
-        return json({
-          success: false,
-          error: "Geçerli kullanıcı adı gerekli."
-        }, 400);
-      }
-
-      // Her Kick kullanıcısının kendine ait
-      // ayrı Durable Object odası olur.
-      const hub =
-        env.USER_HUB.getByName(
-          normalize(username)
-        );
-
-      return hub.fetch(request);
-    }
-
-
-    // =====================================================
-    // ANA WORKER -> REALTIME BİLDİRİM
-    //
-    // Bu endpoint tarayıcı tarafından kullanılmayacak.
-    // weizend-botrix Worker buraya bildirim gönderecek.
-    // =====================================================
-
-    if (path === "/notify") {
-      if (request.method !== "POST") {
-        return json({
-          success: false,
-          error: "POST gerekli."
-        }, 405);
-      }
-
-      const expectedSecret =
-        String(
-          env.REALTIME_SECRET || ""
-        );
-
-      if (!expectedSecret) {
-        return json({
-          success: false,
-          error: "REALTIME_SECRET tanımlı değil."
-        }, 500);
-      }
-
-      const authorization =
-        request.headers.get(
-          "Authorization"
-        ) || "";
-
-      const suppliedSecret =
-        authorization.startsWith("Bearer ")
-          ? authorization.slice(7).trim()
-          : "";
-
-      if (
-        !suppliedSecret ||
-        suppliedSecret !== expectedSecret
-      ) {
-        return json({
-          success: false,
-          error: "UNAUTHORIZED"
-        }, 401);
-      }
-
-      let body;
-
-      try {
-        body =
-          await request.json();
-      } catch {
-        return json({
-          success: false,
-          error: "Geçerli JSON gerekli."
-        }, 400);
-      }
-
-      const username =
-        cleanUsername(
-          body?.user
-        );
-
-      const event =
-        String(
-          body?.event || ""
-        ).trim();
-
-      if (!isValidUsername(username)) {
-        return json({
-          success: false,
-          error: "Geçerli kullanıcı adı gerekli."
-        }, 400);
-      }
-
-      if (
-        ![
-          "profile_changed",
-          "auth_verified"
-        ].includes(event)
-      ) {
-        return json({
-          success: false,
-          error: "Geçersiz realtime olayı."
-        }, 400);
-      }
-
-      const hub =
-        env.USER_HUB.getByName(
-          normalize(username)
-        );
-
-      const notifyRequest =
-        new Request(
-          "https://internal.weizend/notify",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type":
-                "application/json"
-            },
-            body: JSON.stringify({
-              event,
-              username,
-              data:
-                body?.data ?? null,
-
-              sentAt:
-                new Date().toISOString()
-            })
-          }
-        );
-
-      return hub.fetch(
-        notifyRequest
-      );
-    }
-
-
-    // =====================================================
-    // ENDPOINT BULUNAMADI
-    // =====================================================
-
-    return json({
-      success: false,
-      error: "Endpoint bulunamadı."
-    }, 404);
-  }
-};
+const ALLOWED_EVENTS = [
+  "profile_changed",
+  "auth_verified"
+];
 
 
 // =========================================================
-// DURABLE OBJECT
-// Her kullanıcı için bir UserHub instance'ı oluşur.
+// WEIZEND REALTIME WORKER
+//
+// PUBLIC:
+// /
+// /health
+// /ws?user=USERNAME
+//
+// INTERNAL SERVICE BINDING RPC:
+// env.REALTIME.notify(username, event)
 // =========================================================
 
-export class UserHub extends DurableObject {
-  constructor(ctx, env) {
-    super(ctx, env);
+export default class WeizendRealtime extends WorkerEntrypoint {
 
-    // "ping" mesajları Durable Object'ı uyandırmadan
-    // Cloudflare tarafından "pong" ile cevaplanabilir.
-    this.ctx.setWebSocketAutoResponse(
-      new WebSocketRequestResponsePair(
-        "ping",
-        "pong"
-      )
-    );
-  }
-
+  // =======================================================
+  // PUBLIC HTTP / WEBSOCKET
+  // =======================================================
 
   async fetch(request) {
+
     const url =
       new URL(request.url);
 
@@ -226,45 +40,284 @@ export class UserHub extends DurableObject {
 
 
     // =====================================================
-    // TARAYICI WEBSOCKET BAĞLANTISI
+    // TEST
+    // =====================================================
+
+    if (
+      path === "/" ||
+      path === "/health"
+    ) {
+
+      return json({
+        success: true,
+        service: "Weizend Realtime",
+        realtime: "websocket-hibernation-v2",
+        transport: "service-binding-rpc"
+      });
+
+    }
+
+
+    // =====================================================
+    // MARKET -> WEBSOCKET BAĞLANTISI
     // =====================================================
 
     if (path === "/ws") {
+
+      if (request.method !== "GET") {
+
+        return json({
+          success: false,
+          error: "GET gerekli."
+        }, 405);
+
+      }
+
+
       const upgrade =
-        request.headers.get(
-          "Upgrade"
-        ) || "";
+        request.headers.get("Upgrade") || "";
+
 
       if (
         upgrade.toLowerCase() !==
         "websocket"
       ) {
-        return new Response(
-          "WebSocket gerekli.",
-          {
-            status: 426
-          }
-        );
+
+        return json({
+          success: false,
+          error: "WebSocket bağlantısı gerekli."
+        }, 426);
+
       }
 
-      const pair =
-        new WebSocketPair();
 
-      const [client, server] =
-        Object.values(pair);
+      const username =
+        cleanUsername(
+          url.searchParams.get("user")
+        );
 
-      // Hibernation destekli WebSocket.
-      this.ctx.acceptWebSocket(
-        server
+
+      if (!isValidUsername(username)) {
+
+        return json({
+          success: false,
+          error: "Geçerli kullanıcı adı gerekli."
+        }, 400);
+
+      }
+
+
+      // Her Kick kullanıcısının
+      // kendine ait ayrı Durable Object odası vardır.
+
+      const hub =
+        this.env.USER_HUB.getByName(
+          normalize(username)
+        );
+
+
+      return hub.fetch(request);
+    }
+
+
+    // =====================================================
+    // PUBLIC /notify YOK
+    //
+    // Bildirimler artık internet üzerinden gönderilmiyor.
+    //
+    // weizend-botrix:
+    //
+    // await env.REALTIME.notify(...)
+    //
+    // kullanacak.
+    // =====================================================
+
+
+    return json({
+      success: false,
+      error: "Endpoint bulunamadı."
+    }, 404);
+
+  }
+
+
+  // =======================================================
+  // SERVICE BINDING RPC
+  //
+  // ANA weizend-botrix WORKER BURAYI ÇAĞIRACAK.
+  //
+  // ÖRNEK:
+  //
+  // await env.REALTIME.notify(
+  //   "Orkun",
+  //   "profile_changed"
+  // );
+  // =======================================================
+
+  async notify(
+    usernameValue,
+    eventValue
+  ) {
+
+    const username =
+      cleanUsername(
+        usernameValue
       );
 
-      server.serializeAttachment({
-        connectedAt:
-          new Date().toISOString(),
 
-        connectionId:
-          crypto.randomUUID()
-      });
+    const event =
+      String(
+        eventValue || ""
+      ).trim();
+
+
+    if (!isValidUsername(username)) {
+
+      return {
+        success: false,
+        error: "INVALID_USERNAME"
+      };
+
+    }
+
+
+    if (
+      !ALLOWED_EVENTS.includes(event)
+    ) {
+
+      return {
+        success: false,
+        error: "INVALID_EVENT"
+      };
+
+    }
+
+
+    const hub =
+      this.env.USER_HUB.getByName(
+        normalize(username)
+      );
+
+
+    // Direkt ilgili kullanıcının
+    // Durable Object'ına RPC çağrısı.
+
+    return await hub.notify(
+      event,
+      username
+    );
+
+  }
+
+}
+
+
+
+// =========================================================
+// USER HUB DURABLE OBJECT
+//
+// Her kullanıcı adı ayrı Durable Object instance'ıdır.
+//
+// Örnek:
+//
+// Orkun  -> ayrı oda
+// Burak  -> ayrı oda
+// Ali    -> ayrı oda
+//
+// !puanver @Orkun çalışırsa yalnızca
+// Orkun'un odasına bildirim gider.
+// =========================================================
+
+export class UserHub extends DurableObject {
+
+  constructor(ctx, env) {
+
+    super(ctx, env);
+
+
+    // =====================================================
+    // WEBSOCKET HIBERNATION
+    //
+    // Bağlantı açık kalırken Durable Object
+    // boşta olduğunda uyuyabilir.
+    // =====================================================
+
+    this.ctx.setWebSocketAutoResponse(
+
+      new WebSocketRequestResponsePair(
+        "ping",
+        "pong"
+      )
+
+    );
+
+  }
+
+
+
+  // =======================================================
+  // TARAYICI -> WEBSOCKET
+  // =======================================================
+
+  async fetch(request) {
+
+    const upgrade =
+      request.headers.get("Upgrade") || "";
+
+
+    if (
+      request.method !== "GET" ||
+      upgrade.toLowerCase() !== "websocket"
+    ) {
+
+      return new Response(
+        "WebSocket gerekli.",
+        {
+          status: 426
+        }
+      );
+
+    }
+
+
+    const pair =
+      new WebSocketPair();
+
+
+    const [
+      client,
+      server
+    ] =
+      Object.values(pair);
+
+
+    // =====================================================
+    // HIBERNATABLE WEBSOCKET
+    // =====================================================
+
+    this.ctx.acceptWebSocket(
+      server
+    );
+
+
+    // Bağlantıya küçük bir kimlik ekle.
+    // Durable Object uyuyup tekrar uyansa bile
+    // attachment bağlantıyla birlikte korunur.
+
+    server.serializeAttachment({
+
+      connectionId:
+        crypto.randomUUID(),
+
+      connectedAt:
+        new Date().toISOString()
+
+    });
+
+
+    // Tarayıcıya bağlantının başarılı olduğunu bildir.
+
+    try {
 
       server.send(
         JSON.stringify({
@@ -275,145 +328,187 @@ export class UserHub extends DurableObject {
         })
       );
 
-      return new Response(
-        null,
-        {
-          status: 101,
-          webSocket: client
-        }
-      );
-    }
+    } catch {}
 
 
-    // =====================================================
-    // ANA WORKER'DAN BİLDİRİM GELDİ
-    // =====================================================
-
-    if (
-      path === "/notify" &&
-      request.method === "POST"
-    ) {
-      let payload;
-
-      try {
-        payload =
-          await request.json();
-      } catch {
-        return json({
-          success: false,
-          error: "Geçersiz bildirim."
-        }, 400);
+    return new Response(
+      null,
+      {
+        status: 101,
+        webSocket: client
       }
+    );
 
-      const sockets =
-        this.ctx.getWebSockets();
-
-      let delivered = 0;
-
-      const message =
-        JSON.stringify({
-          type:
-            payload.event,
-
-          username:
-            payload.username,
-
-          data:
-            payload.data ?? null,
-
-          sentAt:
-            payload.sentAt ||
-            new Date().toISOString()
-        });
-
-      for (
-        const socket of sockets
-      ) {
-        try {
-          if (
-            socket.readyState === 1
-          ) {
-            socket.send(
-              message
-            );
-
-            delivered++;
-          }
-        } catch {
-          // Kopmuş bağlantıyı atla.
-        }
-      }
-
-      return json({
-        success: true,
-        delivered
-      });
-    }
-
-
-    return json({
-      success: false,
-      error:
-        "Durable Object endpoint bulunamadı."
-    }, 404);
   }
 
 
-  // =====================================================
+
+  // =======================================================
+  // REALTIME BİLDİRİM
+  //
+  // Bu fonksiyon yalnızca Worker RPC tarafından çağrılır.
+  // =======================================================
+
+  async notify(
+    event,
+    username
+  ) {
+
+    const sockets =
+      this.ctx.getWebSockets();
+
+
+    // DİKKAT:
+    // Burada puan / level göndermiyoruz.
+    //
+    // Sadece:
+    //
+    // "Bu kullanıcının profili değişti"
+    //
+    // diyoruz.
+    //
+    // Tarayıcı daha sonra kendi güvenli session tokenı ile
+    // ana Worker'dan /profile çağıracak.
+    //
+    // Böylece kullanıcı verisi WebSocket üzerinden
+    // açık biçimde taşınmıyor.
+
+
+    const message =
+      JSON.stringify({
+
+        type:
+          event,
+
+        username:
+          username,
+
+        sentAt:
+          new Date().toISOString()
+
+      });
+
+
+    let delivered = 0;
+
+
+    for (
+      const socket of sockets
+    ) {
+
+      try {
+
+        if (
+          socket.readyState === 1
+        ) {
+
+          socket.send(
+            message
+          );
+
+          delivered++;
+
+        }
+
+      } catch {
+
+        // Kopmuş bağlantıyı atla.
+
+      }
+
+    }
+
+
+    return {
+      success: true,
+      username,
+      event,
+      delivered
+    };
+
+  }
+
+
+
+  // =======================================================
   // TARAYICIDAN MESAJ GELİRSE
-  // =====================================================
+  // =======================================================
 
   async webSocketMessage(
     socket,
     message
   ) {
-    // Normalde marketten mesaj beklemiyoruz.
-    // ping -> pong işlemini Cloudflare otomatik yapıyor.
+
+    // "ping" mesajına Cloudflare
+    // setWebSocketAutoResponse sayesinde
+    // Durable Object'ı uyandırmadan "pong" verir.
+
 
     if (
       typeof message === "string" &&
       message !== "ping"
     ) {
+
       try {
+
         socket.send(
           JSON.stringify({
             type: "ack"
           })
         );
+
       } catch {}
+
     }
+
   }
 
 
-  // =====================================================
-  // BAĞLANTI KAPANDI
-  // =====================================================
+
+  // =======================================================
+  // WEBSOCKET KAPANDI
+  // =======================================================
 
   async webSocketClose(
     socket,
     code,
     reason
   ) {
+
     try {
+
       socket.close(
         code,
         reason
       );
+
     } catch {}
+
   }
 
+
+
+  // =======================================================
+  // WEBSOCKET HATASI
+  // =======================================================
 
   async webSocketError(
     socket
   ) {
+
     try {
+
       socket.close(
         1011,
         "WebSocket error"
       );
+
     } catch {}
+
   }
+
 }
+
 
 
 // =========================================================
@@ -421,54 +516,68 @@ export class UserHub extends DurableObject {
 // =========================================================
 
 function normalize(value) {
+
   return String(
     value || ""
   )
     .trim()
     .replace(/^@/, "")
     .toLowerCase();
+
 }
 
 
+
 function cleanUsername(value) {
+
   return String(
     value || ""
   )
     .trim()
     .replace(/^@/, "");
+
 }
+
 
 
 function isValidUsername(value) {
+
   const username =
-    String(value || "");
+    String(
+      value || ""
+    );
+
 
   return (
     username.length >= 2 &&
-    username.length <=
-      MAX_USERNAME_LENGTH &&
-    /^[A-Za-z0-9_]+$/.test(
-      username
-    )
+    username.length <= MAX_USERNAME_LENGTH &&
+    /^[A-Za-z0-9_]+$/.test(username)
   );
+
 }
+
 
 
 function json(
   data,
   status = 200
 ) {
+
   return new Response(
     JSON.stringify(data),
     {
       status,
+
       headers: {
+
         "Content-Type":
           "application/json; charset=utf-8",
 
         "Cache-Control":
           "no-store"
+
       }
     }
   );
+
 }
