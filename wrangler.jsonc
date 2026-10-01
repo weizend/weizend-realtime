@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "weizend-realtime",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "USER_HUB",
+        "class_name": "UserHub"
+      }
+    ]
+  },
+
+  "exports": {
+    "UserHub": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}
